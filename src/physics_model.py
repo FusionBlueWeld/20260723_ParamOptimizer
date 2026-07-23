@@ -24,6 +24,14 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import Normalize
 
+from .plot_theme import (
+    BACKGROUND,
+    NEON_GREEN,
+    style_3d_axis,
+    style_colorbar,
+    style_figure,
+)
+
 
 @dataclass(frozen=True)
 class ModelParameters:
@@ -345,6 +353,7 @@ def plot_grid(
     """Plot penetration and spatter as side-by-side 3D scatter plots."""
 
     fig = plt.figure(figsize=(17.0, 7.2), constrained_layout=True)
+    style_figure(fig)
     axes = [
         fig.add_subplot(1, 2, 1, projection="3d"),
         fig.add_subplot(1, 2, 2, projection="3d"),
@@ -375,6 +384,7 @@ def plot_grid(
         pad=0.08,
     )
     depth_cbar.set_label("Depth [mm]")
+    style_colorbar(depth_cbar)
 
     spatter = frame["spatter_level_0_9"].to_numpy()
     spatter_scatter = axes[1].scatter(
@@ -398,8 +408,10 @@ def plot_grid(
         ticks=np.arange(10),
     )
     spatter_cbar.set_label("Ordinal level [0: none, 9: heavy]")
+    style_colorbar(spatter_cbar)
 
     for ax in axes:
+        style_3d_axis(ax)
         ax.set_xlabel("Laser power [kW]", labelpad=10)
         ax.set_ylabel("1/e² spot diameter [µm]", labelpad=10)
         ax.set_zlabel("Scan speed [mm/s]", labelpad=10)
@@ -407,14 +419,21 @@ def plot_grid(
         ax.set_ylim(y.min(), y.max())
         ax.set_zlim(z.min(), z.max())
         ax.view_init(elev=23.0, azim=-56.0)
-        ax.grid(True, alpha=0.25)
+        ax.grid(True)
         ax.set_box_aspect((1.15, 0.9, 1.0))
 
     fig.suptitle(
         "Physics-guided Gaussian-beam laser-welding parameter grid",
         fontsize=15,
+        color="white",
     )
-    fig.savefig(output_path, dpi=190, bbox_inches="tight")
+    fig.savefig(
+        output_path,
+        dpi=190,
+        bbox_inches="tight",
+        facecolor=BACKGROUND,
+        edgecolor=NEON_GREEN,
+    )
     plt.close(fig)
 
 

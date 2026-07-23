@@ -74,12 +74,12 @@ def run_grid(args: argparse.Namespace) -> None:
     print(f"Generated grid points: {len(frame):,}")
     print(
         "Penetration depth: "
-        f"{frame['penetration_depth_mm'].min():.4f}–"
+        f"{frame['penetration_depth_mm'].min():.4f} - "
         f"{frame['penetration_depth_mm'].max():.4f} mm"
     )
     print(
         "Spatter level: "
-        f"{frame['spatter_level_0_9'].min()}–"
+        f"{frame['spatter_level_0_9'].min()} - "
         f"{frame['spatter_level_0_9'].max()}"
     )
     print(csv_path.resolve())
@@ -110,7 +110,7 @@ def run_adaptive_search(args: argparse.Namespace) -> None:
         print(
             f"{box['branch_id']}: "
             f"P={box['laser_power_kw']} kW, "
-            f"d={box['spot_diameter_um']} µm, "
+            f"d={box['spot_diameter_um']} um, "
             f"v={box['scan_speed_mm_s']} mm/s"
         )
     print((args.output_dir / "laser_welding_adaptive_search.gif").resolve())

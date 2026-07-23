@@ -25,7 +25,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, to_rgba
 from PIL import Image
 from scipy.ndimage import label
 from scipy.stats import norm
@@ -36,11 +36,21 @@ from sklearn.gaussian_process.kernels import (
     Matern,
     WhiteKernel,
 )
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from .physics_model import evaluate_model
+from .plot_theme import (
+    BACKGROUND,
+    NEON_GREEN,
+    NEON_PINK,
+    WHITE,
+    style_3d_axis,
+    style_colorbar,
+    style_figure,
+)
 
 
-PINK = "#ff69b4"
+PINK = NEON_PINK
 DEPTH_NORM = Normalize(vmin=0.0, vmax=12.0)
 SPATTER_NORM = Normalize(vmin=0.0, vmax=9.0)
 BRANCH_COLORS = (
@@ -50,6 +60,11 @@ BRANCH_COLORS = (
     "#004d40",
     "#8e24aa",
 )
+BASE_AZIMUTH = -57.0
+ROTATION_DEGREES_PER_FRAME = 5.0
+ROTATION_FRAMES_PER_ACTION = 3
+FINAL_ROTATION_FRAMES = 72
+FINAL_ROTATION_FRAME_DURATION_MS = 120
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,13 @@ class SearchSettings:
     box_merge_containment_ratio: float = 0.80
     box_merge_max_inflation: float = 1.50
     box_merge_max_gap_cells: float = 1.0
+    final_boundary_rounds: int = 2
+    final_boundary_samples_per_round: int = 36
+    final_boundary_acquisition_points: int = 23
+    final_boundary_prediction_points: int = 35
+    final_feasible_probability: float = 0.70
+    final_region_expansion_fraction: float = 0.06
+    final_sample_min_distance: float = 0.055
 
     @property
     def spatter_gp_boundary(self) -> float:
@@ -163,6 +185,20 @@ class SearchUpdate:
     reason: str
     backtracked: bool = False
     global_reexploration: bool = False
+
+
+@dataclass
+class FinalRegion:
+    """Dense, evidence-refined representation of a final feasible region."""
+
+    search_box: SearchBox
+    goal_box: SearchBox
+    power_axis: np.ndarray
+    spot_axis: np.ndarray
+    speed_axis: np.ndarray
+    probability: np.ndarray
+    feasible_mask: np.ndarray
+    boundary_faces: list[list[tuple[float, float, float]]]
 
 
 def normalize_inputs(points: np.ndarray, domain: SearchBox) -> np.ndarray:
@@ -333,6 +369,436 @@ def fit_gaussian_processes(
         models.append(model)
 
     return models[0], models[1]
+
+
+def evaluate_requested_points(
+    points: np.ndarray,
+    step: int,
+    source_branch: str,
+    experiment_cache: dict[
+        tuple[float, float, float],
+        dict[str, object],
+    ],
+) -> np.ndarray:
+    """Evaluate arbitrary new points and add them to the experiment history."""
+
+    unique: dict[tuple[float, float, float], np.ndarray] = {}
+    for point in np.asarray(points, dtype=float):
+        key = point_key(point)
+        if key not in experiment_cache:
+            unique.setdefault(key, point.copy())
+    if not unique:
+        return np.empty((0, 3), dtype=float)
+
+    new_points = np.vstack(list(unique.values()))
+    outputs = evaluate_model(
+        new_points[:, 0],
+        new_points[:, 1],
+        new_points[:, 2],
+    )
+    for index, key in enumerate(unique):
+        experiment_cache[key] = {
+            "laser_power_w": float(new_points[index, 0]),
+            "spot_diameter_um": float(new_points[index, 1]),
+            "scan_speed_mm_s": float(new_points[index, 2]),
+            "penetration_depth_mm": float(
+                outputs["penetration_depth_mm"][index]
+            ),
+            "spatter_level_0_9": int(
+                outputs["spatter_level_0_9"][index]
+            ),
+            "spatter_propensity": float(
+                outputs["spatter_propensity"][index]
+            ),
+            "normalized_enthalpy": float(
+                outputs["normalized_enthalpy"][index]
+            ),
+            "keyhole_gate": float(outputs["keyhole_gate"][index]),
+            "first_sampled_step": int(step),
+            "source_branch": source_branch,
+        }
+    return new_points
+
+
+def predict_constraints(
+    points: np.ndarray,
+    depth_gp: GaussianProcessRegressor,
+    spatter_gp: GaussianProcessRegressor,
+    domain: SearchBox,
+    settings: SearchSettings,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Predict both outputs and their joint constraint probability."""
+
+    x = normalize_inputs(points, domain)
+    mean_depth, std_depth = depth_gp.predict(x, return_std=True)
+    mean_spatter, std_spatter = spatter_gp.predict(x, return_std=True)
+    std_depth = np.maximum(std_depth, 0.03)
+    std_spatter = np.maximum(std_spatter, 0.15)
+    depth_probability = norm.cdf(
+        (mean_depth - settings.depth_min_mm) / std_depth
+    )
+    spatter_probability = norm.cdf(
+        (settings.spatter_gp_boundary - mean_spatter) / std_spatter
+    )
+    return (
+        mean_depth,
+        std_depth,
+        mean_spatter,
+        std_spatter,
+        depth_probability * spatter_probability,
+    )
+
+
+def expanded_final_box(
+    box: SearchBox,
+    domain: SearchBox,
+    settings: SearchSettings,
+) -> SearchBox:
+    """Expand a converged search box so its actual boundary can be audited."""
+
+    bounds = box.as_bounds()
+    margin = settings.final_region_expansion_fraction * domain.widths()
+    domain_bounds = domain.as_bounds()
+    expanded = np.column_stack(
+        [
+            np.maximum(bounds[:, 0] - margin, domain_bounds[:, 0]),
+            np.minimum(bounds[:, 1] + margin, domain_bounds[:, 1]),
+        ]
+    )
+    return box_from_bounds(
+        expanded,
+        f"{box.branch_id}.GOAL",
+        box.branch_id,
+    )
+
+
+def dense_box_points(
+    box: SearchBox,
+    points_per_axis: int,
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
+    """Create a dense Cartesian prediction lattice inside a search box."""
+
+    axes = (
+        np.linspace(
+            box.power_min_w,
+            box.power_max_w,
+            points_per_axis,
+        ),
+        np.linspace(
+            box.spot_min_um,
+            box.spot_max_um,
+            points_per_axis,
+        ),
+        np.linspace(
+            box.speed_min_mm_s,
+            box.speed_max_mm_s,
+            points_per_axis,
+        ),
+    )
+    grids = np.meshgrid(*axes, indexing="ij")
+    points = np.column_stack([grid.ravel() for grid in grids])
+    return axes, points
+
+
+def select_boundary_acquisition_points(
+    box: SearchBox,
+    depth_gp: GaussianProcessRegressor,
+    spatter_gp: GaussianProcessRegressor,
+    domain: SearchBox,
+    settings: SearchSettings,
+    experiment_cache: dict[
+        tuple[float, float, float],
+        dict[str, object],
+    ],
+) -> np.ndarray:
+    """Select diverse, uncertain points nearest either constraint boundary."""
+
+    _, points = dense_box_points(
+        box,
+        settings.final_boundary_acquisition_points,
+    )
+    (
+        mean_depth,
+        std_depth,
+        mean_spatter,
+        std_spatter,
+        probability,
+    ) = predict_constraints(
+        points,
+        depth_gp,
+        spatter_gp,
+        domain,
+        settings,
+    )
+
+    depth_distance = np.abs(
+        mean_depth - settings.depth_min_mm
+    ) / np.maximum(std_depth, 0.08)
+    spatter_distance = np.abs(
+        mean_spatter - settings.spatter_gp_boundary
+    ) / np.maximum(std_spatter, 0.25)
+    boundary_proximity = np.exp(
+        -np.minimum(depth_distance, spatter_distance)
+    )
+    uncertainty = (
+        std_depth / max(settings.depth_std_tolerance_mm, 1.0e-9)
+        + std_spatter / max(settings.spatter_std_tolerance, 1.0e-9)
+    )
+    uncertainty /= max(float(uncertainty.max()), 1.0e-9)
+    probability_proximity = np.exp(
+        -4.0 * np.abs(
+            probability - settings.final_feasible_probability
+        )
+    )
+    score = (
+        0.55 * boundary_proximity
+        + 0.25 * probability_proximity
+        + 0.20 * uncertainty
+    )
+
+    plausible = (
+        (
+            mean_depth + settings.confidence_z * std_depth
+            >= settings.depth_min_mm
+        )
+        & (
+            mean_spatter - settings.confidence_z * std_spatter
+            < settings.spatter_gp_boundary
+        )
+    )
+    score = np.where(plausible, score, -np.inf)
+    score = np.where(
+        np.array(
+            [point_key(point) not in experiment_cache for point in points],
+            dtype=bool,
+        ),
+        score,
+        -np.inf,
+    )
+
+    normalized = normalize_inputs(points, domain)
+    selected_indices: list[int] = []
+    for index in np.argsort(score)[::-1]:
+        if not np.isfinite(score[index]):
+            break
+        if selected_indices:
+            distances = np.linalg.norm(
+                normalized[selected_indices] - normalized[index],
+                axis=1,
+            )
+            if float(distances.min()) < settings.final_sample_min_distance:
+                continue
+        selected_indices.append(int(index))
+        if len(selected_indices) >= settings.final_boundary_samples_per_round:
+            break
+    if not selected_indices:
+        return np.empty((0, 3), dtype=float)
+    return points[selected_indices]
+
+
+def axis_cell_edges(axis: np.ndarray) -> np.ndarray:
+    """Convert cell-center coordinates into edge coordinates."""
+
+    edges = np.empty(len(axis) + 1, dtype=float)
+    edges[1:-1] = 0.5 * (axis[:-1] + axis[1:])
+    edges[0] = axis[0] - 0.5 * (axis[1] - axis[0])
+    edges[-1] = axis[-1] + 0.5 * (axis[-1] - axis[-2])
+    return edges
+
+
+def boundary_faces_from_mask(
+    mask: np.ndarray,
+    axes: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> list[list[tuple[float, float, float]]]:
+    """Create only the exposed voxel faces of a 3D feasible mask."""
+
+    x_edges, y_edges, z_edges = (
+        axis_cell_edges(axis) for axis in axes
+    )
+    faces: list[list[tuple[float, float, float]]] = []
+    shape = np.array(mask.shape)
+    directions = (
+        (-1, 0, 0),
+        (1, 0, 0),
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+    )
+    for i, j, k in np.argwhere(mask):
+        x0, x1 = x_edges[i], x_edges[i + 1]
+        y0, y1 = y_edges[j], y_edges[j + 1]
+        z0, z1 = z_edges[k], z_edges[k + 1]
+        voxel_faces = (
+            [(x0, y0, z0), (x0, y1, z0),
+             (x0, y1, z1), (x0, y0, z1)],
+            [(x1, y0, z0), (x1, y0, z1),
+             (x1, y1, z1), (x1, y1, z0)],
+            [(x0, y0, z0), (x0, y0, z1),
+             (x1, y0, z1), (x1, y0, z0)],
+            [(x0, y1, z0), (x1, y1, z0),
+             (x1, y1, z1), (x0, y1, z1)],
+            [(x0, y0, z0), (x1, y0, z0),
+             (x1, y1, z0), (x0, y1, z0)],
+            [(x0, y0, z1), (x0, y1, z1),
+             (x1, y1, z1), (x1, y0, z1)],
+        )
+        for face_index, direction in enumerate(directions):
+            neighbor = np.array([i, j, k]) + direction
+            exposed = bool(
+                np.any(neighbor < 0)
+                or np.any(neighbor >= shape)
+                or not mask[tuple(neighbor)]
+            )
+            if exposed:
+                faces.append(voxel_faces[face_index])
+    return faces
+
+
+def final_region_from_gp(
+    search_box: SearchBox,
+    depth_gp: GaussianProcessRegressor,
+    spatter_gp: GaussianProcessRegressor,
+    domain: SearchBox,
+    settings: SearchSettings,
+) -> FinalRegion | None:
+    """Build a dense, probability-qualified final feasible region."""
+
+    axes, points = dense_box_points(
+        search_box,
+        settings.final_boundary_prediction_points,
+    )
+    (
+        mean_depth,
+        _,
+        mean_spatter,
+        _,
+        probability,
+    ) = predict_constraints(
+        points,
+        depth_gp,
+        spatter_gp,
+        domain,
+        settings,
+    )
+    shape = (settings.final_boundary_prediction_points,) * 3
+    feasible = (
+        (mean_depth >= settings.depth_min_mm)
+        & (mean_spatter < settings.spatter_gp_boundary)
+        & (probability >= settings.final_feasible_probability)
+    ).reshape(shape)
+    labels, count = label(feasible)
+    if count == 0:
+        return None
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    feasible = labels == int(np.argmax(sizes))
+
+    indices = np.argwhere(feasible)
+    edges = tuple(axis_cell_edges(axis) for axis in axes)
+    lower = np.array(
+        [edges[axis][indices[:, axis].min()] for axis in range(3)]
+    )
+    upper = np.array(
+        [edges[axis][indices[:, axis].max() + 1] for axis in range(3)]
+    )
+    domain_bounds = domain.as_bounds()
+    goal_bounds = np.column_stack(
+        [
+            np.maximum(lower, domain_bounds[:, 0]),
+            np.minimum(upper, domain_bounds[:, 1]),
+        ]
+    )
+    goal_box = box_from_bounds(
+        goal_bounds,
+        search_box.branch_id,
+        search_box.parent_id,
+    )
+    return FinalRegion(
+        search_box=search_box,
+        goal_box=goal_box,
+        power_axis=axes[0],
+        spot_axis=axes[1],
+        speed_axis=axes[2],
+        probability=probability.reshape(shape),
+        feasible_mask=feasible,
+        boundary_faces=boundary_faces_from_mask(feasible, axes),
+    )
+
+
+def refine_final_regions(
+    final_boxes: list[SearchBox],
+    domain: SearchBox,
+    settings: SearchSettings,
+    experiment_cache: dict[
+        tuple[float, float, float],
+        dict[str, object],
+    ],
+    first_sampled_step: int,
+) -> tuple[list[FinalRegion], np.ndarray]:
+    """Actively measure final boundaries, then construct goal regions."""
+
+    search_boxes = [
+        expanded_final_box(box, domain, settings) for box in final_boxes
+    ]
+    acquired: list[np.ndarray] = []
+    for round_index in range(settings.final_boundary_rounds):
+        frame = experiment_frame(experiment_cache)
+        depth_gp, spatter_gp = fit_gaussian_processes(
+            frame,
+            domain,
+            settings.random_seed + 1000 + round_index,
+        )
+        candidates = [
+            select_boundary_acquisition_points(
+                box,
+                depth_gp,
+                spatter_gp,
+                domain,
+                settings,
+                experiment_cache,
+            )
+            for box in search_boxes
+        ]
+        candidates = [points for points in candidates if len(points)]
+        if not candidates:
+            break
+        new_points = evaluate_requested_points(
+            np.vstack(candidates),
+            first_sampled_step + round_index,
+            f"FINAL_BOUNDARY_R{round_index + 1}",
+            experiment_cache,
+        )
+        if not len(new_points):
+            break
+        acquired.append(new_points)
+
+    final_frame = experiment_frame(experiment_cache)
+    depth_gp, spatter_gp = fit_gaussian_processes(
+        final_frame,
+        domain,
+        settings.random_seed + 2000,
+    )
+    regions = [
+        region
+        for box in search_boxes
+        if (
+            region := final_region_from_gp(
+                box,
+                depth_gp,
+                spatter_gp,
+                domain,
+                settings,
+            )
+        )
+        is not None
+    ]
+    acquired_points = (
+        np.vstack(acquired)
+        if acquired
+        else np.empty((0, 3), dtype=float)
+    )
+    return regions, acquired_points
 
 
 def make_component_boxes(
@@ -1141,7 +1607,7 @@ def draw_wire_grid(
     box: SearchBox,
     points_per_axis: int,
     phase: int,
-    color: str = "black",
+    color: str = NEON_GREEN,
     linewidth: float = 0.65,
     alpha: float = 0.48,
 ) -> None:
@@ -1281,7 +1747,7 @@ def plot_measured_points(
         cmap="jet",
         norm=norm,
         s=marker_size,
-        edgecolor="black",
+        edgecolor=NEON_GREEN,
         linewidth=0.28,
         alpha=0.96,
         depthshade=False,
@@ -1325,7 +1791,8 @@ def style_axis(
     ax.set_title(title, fontsize=12, pad=12)
     ax.view_init(elev=24.0, azim=-57.0)
     ax.set_box_aspect((1.15, 0.90, 1.0))
-    ax.grid(True, alpha=0.18)
+    style_3d_axis(ax)
+    ax.grid(True)
     query = (
         f"Query: depth ≥ {settings.depth_min_mm:g} mm, "
         f"spatter < {settings.spatter_max_exclusive}"
@@ -1337,7 +1804,12 @@ def style_axis(
         transform=ax.transAxes,
         va="top",
         fontsize=8.5,
-        bbox=dict(facecolor="white", alpha=0.78, edgecolor="none"),
+        color=WHITE,
+        bbox=dict(
+            facecolor=BACKGROUND,
+            alpha=0.88,
+            edgecolor=NEON_GREEN,
+        ),
     )
 
 
@@ -1357,13 +1829,19 @@ def draw_stage(
 ) -> None:
     if stage == 1:
         for box in active_boxes:
-            draw_wire_grid(ax, box, grid_points_per_axis, grid_phase)
+            draw_wire_grid(
+                ax,
+                box,
+                grid_points_per_axis,
+                grid_phase,
+                color=NEON_GREEN,
+            )
         if len(requested_points):
             ax.scatter(
                 requested_points[:, 0] / 1000.0,
                 requested_points[:, 1],
                 requested_points[:, 2],
-                color="black",
+                color=NEON_GREEN,
                 s=22,
                 alpha=0.82,
                 depthshade=False,
@@ -1372,7 +1850,13 @@ def draw_stage(
         display_boxes = active_boxes
     elif stage == 2:
         for box in active_boxes:
-            draw_box(ax, box, color="black", linewidth=1.0, alpha=0.45)
+            draw_box(
+                ax,
+                box,
+                color=NEON_GREEN,
+                linewidth=1.0,
+                alpha=0.45,
+            )
         plot_pink_regions(ax, analyses, settings, rng)
         measured_feasible = (
             (frame["penetration_depth_mm"] >= settings.depth_min_mm)
@@ -1387,7 +1871,7 @@ def draw_stage(
             infeasible["laser_power_w"] / 1000.0,
             infeasible["spot_diameter_um"],
             infeasible["scan_speed_mm_s"],
-            color="#424242",
+            color="#b8b8b8",
             s=11,
             alpha=0.40,
             depthshade=False,
@@ -1397,7 +1881,7 @@ def draw_stage(
                 feasible["laser_power_w"] / 1000.0,
                 feasible["spot_diameter_um"],
                 feasible["scan_speed_mm_s"],
-                color="#00a651",
+                color=NEON_GREEN,
                 edgecolor="white",
                 linewidth=0.25,
                 s=28,
@@ -1454,6 +1938,7 @@ def render_step_figures(
 
     for stage in (1, 2, 3):
         fig = plt.figure(figsize=(7.4, 6.3), constrained_layout=True)
+        style_figure(fig)
         ax = fig.add_subplot(1, 1, 1, projection="3d")
         draw_stage(
             ax,
@@ -1470,11 +1955,12 @@ def render_step_figures(
             rng,
         )
         path = output_dir / f"step_{step:02d}_{stage}.png"
-        fig.savefig(path, dpi=145, facecolor="white")
+        fig.savefig(path, dpi=145, facecolor=BACKGROUND)
         plt.close(fig)
         individual_paths.append(path)
 
     summary = plt.figure(figsize=(19.2, 6.2), constrained_layout=True)
+    style_figure(summary)
     for stage in (1, 2, 3):
         ax = summary.add_subplot(1, 3, stage, projection="3d")
         draw_stage(
@@ -1494,13 +1980,14 @@ def render_step_figures(
     summary.suptitle(
         "Adaptive coarse-to-fine laser-welding condition search",
         fontsize=15,
+        color=WHITE,
     )
     summary_path = output_dir / f"step_{step:02d}_summary.png"
     summary.savefig(
         summary_path,
         dpi=135,
         bbox_inches="tight",
-        facecolor="white",
+        facecolor=BACKGROUND,
     )
     plt.close(summary)
     return individual_paths, summary_path
@@ -1524,6 +2011,7 @@ def retained_volume_percent(
 def style_transition_axis(
     ax: plt.Axes,
     domain: SearchBox,
+    azimuth: float = BASE_AZIMUTH,
 ) -> None:
     """Use one fixed coordinate system for every GIF frame."""
 
@@ -1534,9 +2022,38 @@ def style_transition_axis(
     ax.set_xlabel("Laser power [kW]", labelpad=10)
     ax.set_ylabel("1/e² spot diameter [µm]", labelpad=10)
     ax.set_zlabel("Scan speed [mm/s]", labelpad=10)
-    ax.view_init(elev=24.0, azim=-57.0)
+    ax.view_init(elev=24.0, azim=azimuth)
     ax.set_box_aspect((1.15, 0.90, 1.0))
-    ax.grid(True, alpha=0.12)
+    style_3d_axis(ax)
+    ax.grid(True)
+
+
+def action_azimuth(
+    action_index: int,
+    rotation_frame: int,
+) -> float:
+    """Return the continuously advancing camera angle for one subframe."""
+
+    completed_frames = (
+        action_index * ROTATION_FRAMES_PER_ACTION + rotation_frame
+    )
+    return (
+        BASE_AZIMUTH
+        + ROTATION_DEGREES_PER_FRAME * completed_frames
+    )
+
+
+def split_action_duration(duration_ms: int) -> list[int]:
+    """Split one action's display time evenly across rotation frames."""
+
+    base_duration, remainder = divmod(
+        duration_ms,
+        ROTATION_FRAMES_PER_ACTION,
+    )
+    return [
+        base_duration + (1 if index < remainder else 0)
+        for index in range(ROTATION_FRAMES_PER_ACTION)
+    ]
 
 
 def create_output_figure(
@@ -1544,12 +2061,20 @@ def create_output_figure(
 ) -> tuple[plt.Figure, tuple[plt.Axes, plt.Axes]]:
     """Create the paired penetration-depth and spatter 3D charts."""
 
-    fig = plt.figure(figsize=(17.0, 7.2), constrained_layout=True)
+    fig = plt.figure(figsize=(17.0, 8.8))
+    style_figure(fig)
+    fig.subplots_adjust(
+        left=0.035,
+        right=0.965,
+        bottom=0.16,
+        top=0.88,
+        wspace=0.16,
+    )
     axes = (
         fig.add_subplot(1, 2, 1, projection="3d"),
         fig.add_subplot(1, 2, 2, projection="3d"),
     )
-    fig.suptitle(title, fontsize=16, weight="bold")
+    fig.suptitle(title, fontsize=16, weight="bold", color=WHITE)
     return fig, axes
 
 
@@ -1574,6 +2099,7 @@ def add_output_colorbars(
             ticks=ticks,
         )
         colorbar.set_label(label, fontsize=9)
+        style_colorbar(colorbar)
 
 
 def save_figure_atomic(
@@ -1591,7 +2117,7 @@ def save_figure_atomic(
             fig.savefig(
                 temporary,
                 dpi=dpi,
-                facecolor="white",
+                facecolor=BACKGROUND,
                 format="png",
             )
             with Image.open(temporary) as image:
@@ -1604,48 +2130,176 @@ def save_figure_atomic(
     raise OSError(f"Could not write a complete PNG: {path}") from last_error
 
 
-def render_initial_grid_frame(
+def render_initial_grid_frames(
     output_dir: Path,
     domain: SearchBox,
     grid_points_per_axis: int,
     settings: SearchSettings,
-) -> tuple[Path, int]:
-    """Render the initial black search grid before any experiments."""
+) -> tuple[list[Path], list[int]]:
+    """Render three rotating initial-grid frames."""
 
-    fig, axes = create_output_figure("Step 0  |  Action 2/2")
-    for ax in axes:
-        draw_wire_grid(
-            ax,
-            domain,
-            grid_points_per_axis,
-            phase=0,
-            color="black",
-            linewidth=0.72,
-            alpha=0.52,
+    paths: list[Path] = []
+    for rotation_frame in range(1, ROTATION_FRAMES_PER_ACTION + 1):
+        fig, axes = create_output_figure("Step 0  |  Action 2/2")
+        azimuth = action_azimuth(1, rotation_frame)
+        for ax in axes:
+            draw_wire_grid(
+                ax,
+                domain,
+                grid_points_per_axis,
+                phase=0,
+                color=NEON_GREEN,
+                linewidth=0.72,
+                alpha=0.52,
+            )
+            style_transition_axis(ax, domain, azimuth)
+        add_output_colorbars(fig, axes)
+        path = output_dir / (
+            "animation_step_00_action_02_"
+            f"rotation_{rotation_frame:02d}.png"
         )
-        style_transition_axis(ax, domain)
-    add_output_colorbars(fig, axes)
-    path = output_dir / "animation_step_00_initial_grid.png"
-    save_figure_atomic(fig, path)
-    plt.close(fig)
-    return path, 1400
+        save_figure_atomic(fig, path)
+        plt.close(fig)
+        paths.append(path)
+    return paths, split_action_duration(1400)
 
 
-def render_empty_space_frame(
+def render_empty_space_frames(
     output_dir: Path,
     domain: SearchBox,
     settings: SearchSettings,
-) -> tuple[Path, int]:
-    """Render the empty parameter space before the initial grid appears."""
+) -> tuple[list[Path], list[int]]:
+    """Render three rotating empty-space frames."""
 
-    fig, axes = create_output_figure("Step 0  |  Action 1/2")
-    for ax in axes:
-        style_transition_axis(ax, domain)
-    add_output_colorbars(fig, axes)
-    path = output_dir / "animation_start_empty_space.png"
-    save_figure_atomic(fig, path)
-    plt.close(fig)
-    return path, 1200
+    paths: list[Path] = []
+    for rotation_frame in range(1, ROTATION_FRAMES_PER_ACTION + 1):
+        fig, axes = create_output_figure("Step 0  |  Action 1/2")
+        azimuth = action_azimuth(0, rotation_frame)
+        for ax in axes:
+            style_transition_axis(ax, domain, azimuth)
+        add_output_colorbars(fig, axes)
+        path = output_dir / (
+            "animation_step_00_action_01_"
+            f"rotation_{rotation_frame:02d}.png"
+        )
+        save_figure_atomic(fig, path)
+        plt.close(fig)
+        paths.append(path)
+    return paths, split_action_duration(1200)
+
+
+def draw_transition_action(
+    ax: plt.Axes,
+    action_number: int,
+    active_boxes: list[SearchBox],
+    next_boxes: list[SearchBox],
+    analyses: list[BoxAnalysis],
+    current_rows: pd.DataFrame,
+    output_column: str,
+    norm: Normalize,
+    grid_points_per_axis: int,
+    grid_phase: int,
+    settings: SearchSettings,
+    step: int,
+) -> None:
+    """Draw one search action before applying its rotating camera view."""
+
+    if action_number == 1:
+        for box in active_boxes:
+            draw_wire_grid(
+                ax,
+                box,
+                grid_points_per_axis,
+                grid_phase,
+                color=NEON_GREEN,
+                linewidth=0.72,
+                alpha=0.52,
+            )
+        plot_measured_points(
+            ax,
+            current_rows,
+            output_column,
+            norm,
+            marker_size=48.0,
+        )
+
+    elif action_number == 2:
+        for box in active_boxes:
+            draw_wire_grid(
+                ax,
+                box,
+                grid_points_per_axis,
+                grid_phase,
+                color=NEON_GREEN,
+                linewidth=0.60,
+                alpha=0.34,
+            )
+        plot_pink_regions(
+            ax,
+            analyses,
+            settings,
+            np.random.default_rng(settings.random_seed + 100 * step),
+            max_points=6500,
+        )
+        plot_measured_points(
+            ax,
+            current_rows,
+            output_column,
+            norm,
+            marker_size=39.0,
+        )
+
+    elif action_number == 3:
+        plot_pink_regions(
+            ax,
+            analyses,
+            settings,
+            np.random.default_rng(settings.random_seed + 100 * step),
+            max_points=6500,
+        )
+        for box in next_boxes:
+            draw_wire_grid(
+                ax,
+                box,
+                grid_points_per_axis,
+                grid_phase + 1,
+                color=PINK,
+                linewidth=1.20,
+                alpha=0.82,
+            )
+            ax.text(
+                box.power_min_w / 1000.0,
+                box.spot_min_um,
+                box.speed_max_mm_s,
+                box.branch_id,
+                color=NEON_PINK,
+                fontsize=10,
+                weight="bold",
+            )
+        if not next_boxes:
+            ax.text2D(
+                0.50,
+                0.50,
+                "No promising region remains",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=16,
+                color="#c62828",
+                weight="bold",
+            )
+
+    else:
+        for box in next_boxes:
+            draw_wire_grid(
+                ax,
+                box,
+                grid_points_per_axis,
+                grid_phase + 1,
+                color=NEON_GREEN,
+                linewidth=0.78,
+                alpha=0.56,
+            )
 
 
 def render_transition_frames(
@@ -1662,10 +2316,13 @@ def render_transition_frames(
     settings: SearchSettings,
     terminal_status: str | None,
 ) -> tuple[list[Path], list[int]]:
-    """Render four paired-output frames for one search step."""
+    """Render three rotating paired-output frames for each search action."""
 
     paths: list[Path] = []
-    durations = [1200, 1650, 1250, 950]
+    action_durations = [1200, 1650, 1250, 950]
+    if terminal_status in {"converged", "no_feasible_region"}:
+        action_durations[-1] = 1900
+    durations: list[int] = []
     output_specs = (
         ("penetration_depth_mm", DEPTH_NORM),
         ("spatter_level_0_9", SPATTER_NORM),
@@ -1673,129 +2330,149 @@ def render_transition_frames(
     current_rows = rows_at_requested_points(frame, requested_points)
 
     for action_number in range(1, 5):
-        fig, axes = create_output_figure(
-            f"Step {step}  |  Action {action_number}/4"
+        action_index = 2 + (step - 1) * 4 + (action_number - 1)
+        for rotation_frame in range(1, ROTATION_FRAMES_PER_ACTION + 1):
+            fig, axes = create_output_figure(
+                f"Step {step}  |  Action {action_number}/4"
+            )
+            azimuth = action_azimuth(action_index, rotation_frame)
+            for ax, (output_column, norm) in zip(axes, output_specs):
+                draw_transition_action(
+                    ax,
+                    action_number,
+                    active_boxes,
+                    next_boxes,
+                    analyses,
+                    current_rows,
+                    output_column,
+                    norm,
+                    grid_points_per_axis,
+                    grid_phase,
+                    settings,
+                    step,
+                )
+                style_transition_axis(ax, domain, azimuth)
+
+            add_output_colorbars(fig, axes)
+            path = output_dir / (
+                f"animation_step_{step:02d}_"
+                f"action_{action_number:02d}_"
+                f"rotation_{rotation_frame:02d}.png"
+            )
+            save_figure_atomic(fig, path)
+            plt.close(fig)
+            paths.append(path)
+        durations.extend(
+            split_action_duration(action_durations[action_number - 1])
         )
-        for ax, (output_column, norm) in zip(axes, output_specs):
-            if action_number == 1:
-                for box in active_boxes:
-                    draw_wire_grid(
-                        ax,
-                        box,
-                        grid_points_per_axis,
-                        grid_phase,
-                        color="black",
-                        linewidth=0.72,
-                        alpha=0.52,
-                    )
-                plot_measured_points(
-                    ax,
-                    current_rows,
-                    output_column,
-                    norm,
-                    marker_size=48.0,
+    return paths, durations
+
+
+def plot_final_region_surface(
+    ax: plt.Axes,
+    region: FinalRegion,
+) -> None:
+    """Draw the data-derived outer boundary of one final goal region."""
+
+    faces = [
+        [(x / 1000.0, y, z) for x, y, z in face]
+        for face in region.boundary_faces
+    ]
+    surface = Poly3DCollection(
+        faces,
+        facecolors=to_rgba(NEON_PINK, 0.17),
+        edgecolors="none",
+        linewidths=0.0,
+    )
+    ax.add_collection3d(surface)
+
+
+def render_final_goal_frames(
+    output_dir: Path,
+    completed_steps: int,
+    domain: SearchBox,
+    regions: list[FinalRegion],
+    frame: pd.DataFrame,
+    acquired_points: np.ndarray,
+    settings: SearchSettings,
+) -> tuple[list[Path], list[int]]:
+    """Render the evidence-backed final region as a rotating conclusion."""
+
+    paths: list[Path] = []
+    output_specs = (
+        ("penetration_depth_mm", DEPTH_NORM),
+        ("spatter_level_0_9", SPATTER_NORM),
+    )
+    region_boxes = [region.search_box for region in regions]
+    evidence = rows_inside_boxes(frame, region_boxes)
+    final_sources = evidence["source_branch"].astype(str).str.startswith(
+        "FINAL_BOUNDARY"
+    )
+    historical = evidence.loc[~final_sources]
+    boundary_evidence = evidence.loc[final_sources]
+    action_index = 2 + completed_steps * 4
+
+    for rotation_frame in range(1, FINAL_ROTATION_FRAMES + 1):
+        fig, axes = create_output_figure(
+            "GOAL  |  Confirmed optimal-condition region"
+        )
+        azimuth = action_azimuth(action_index, rotation_frame)
+        for ax, (output_column, output_norm) in zip(axes, output_specs):
+            for region in regions:
+                plot_final_region_surface(ax, region)
+            plot_measured_points(
+                ax,
+                historical,
+                output_column,
+                output_norm,
+                marker_size=17.0,
+            )
+            if not boundary_evidence.empty:
+                ax.scatter(
+                    boundary_evidence["laser_power_w"] / 1000.0,
+                    boundary_evidence["spot_diameter_um"],
+                    boundary_evidence["scan_speed_mm_s"],
+                    c=boundary_evidence[output_column],
+                    cmap="jet",
+                    norm=output_norm,
+                    s=46,
+                    edgecolor=WHITE,
+                    linewidth=0.65,
+                    alpha=1.0,
+                    depthshade=False,
                 )
-
-            elif action_number == 2:
-                for box in active_boxes:
-                    draw_wire_grid(
-                        ax,
-                        box,
-                        grid_points_per_axis,
-                        grid_phase,
-                        color="black",
-                        linewidth=0.60,
-                        alpha=0.34,
-                    )
-                plot_pink_regions(
-                    ax,
-                    analyses,
-                    settings,
-                    np.random.default_rng(
-                        settings.random_seed + 100 * step
-                    ),
-                    max_points=6500,
-                )
-                plot_measured_points(
-                    ax,
-                    current_rows,
-                    output_column,
-                    norm,
-                    marker_size=39.0,
-                )
-
-            elif action_number == 3:
-                # Keep the joint GP probability region visible while the
-                # measured points are cleared and both output grids are recut.
-                plot_pink_regions(
-                    ax,
-                    analyses,
-                    settings,
-                    np.random.default_rng(
-                        settings.random_seed + 100 * step
-                    ),
-                    max_points=6500,
-                )
-                for box in next_boxes:
-                    draw_wire_grid(
-                        ax,
-                        box,
-                        grid_points_per_axis,
-                        grid_phase + 1,
-                        color=PINK,
-                        linewidth=1.20,
-                        alpha=0.82,
-                    )
-                    ax.text(
-                        box.power_min_w / 1000.0,
-                        box.spot_min_um,
-                        box.speed_max_mm_s,
-                        box.branch_id,
-                        color="#c2185b",
-                        fontsize=10,
-                        weight="bold",
-                    )
-                if not next_boxes:
-                    ax.text2D(
-                        0.50,
-                        0.50,
-                        "No promising region remains",
-                        transform=ax.transAxes,
-                        ha="center",
-                        va="center",
-                        fontsize=16,
-                        color="#c62828",
-                        weight="bold",
-                    )
-
-            else:
-                # The pink distribution is cleared when both recut grids
-                # become the next active black grids.
-                for box in next_boxes:
-                    draw_wire_grid(
-                        ax,
-                        box,
-                        grid_points_per_axis,
-                        grid_phase + 1,
-                        color="black",
-                        linewidth=0.78,
-                        alpha=0.56,
-                    )
-
-            style_transition_axis(ax, domain)
-
+            style_transition_axis(ax, domain, azimuth)
+            ax.text2D(
+                0.02,
+                0.97,
+                (
+                    f"Goal probability >= "
+                    f"{settings.final_feasible_probability:.0%}\n"
+                    f"All evidence: {len(frame)} | "
+                    f"boundary acquisitions: {len(acquired_points)}"
+                ),
+                transform=ax.transAxes,
+                va="top",
+                color=WHITE,
+                fontsize=9,
+                bbox=dict(
+                    facecolor=BACKGROUND,
+                    edgecolor=NEON_PINK,
+                    alpha=0.90,
+                ),
+            )
         add_output_colorbars(fig, axes)
-        path = (
-            output_dir
-            / f"animation_step_{step:02d}_action_{action_number:02d}.png"
+        path = output_dir / (
+            "animation_final_goal_"
+            f"rotation_{rotation_frame:02d}.png"
         )
         save_figure_atomic(fig, path)
         plt.close(fig)
         paths.append(path)
-
-    if terminal_status in {"converged", "no_feasible_region"}:
-        durations[-1] = 1900
-    return paths, durations
+    return (
+        paths,
+        [FINAL_ROTATION_FRAME_DURATION_MS] * FINAL_ROTATION_FRAMES,
+    )
 
 
 def create_gif(
@@ -1856,19 +2533,21 @@ def run_search(
         tuple[float, float, float],
         dict[str, object],
     ] = {}
-    empty_path, empty_duration = render_empty_space_frame(
+    empty_paths, empty_durations = render_empty_space_frames(
         output_dir,
         domain,
         settings,
     )
-    initial_path, initial_duration = render_initial_grid_frame(
+    initial_paths, initial_durations = render_initial_grid_frames(
         output_dir,
         domain,
         settings.coarse_points_per_axis,
         settings,
     )
-    animation_paths: list[Path] = [empty_path, initial_path]
-    animation_durations: list[int] = [empty_duration, initial_duration]
+    animation_paths: list[Path] = empty_paths + initial_paths
+    animation_durations: list[int] = (
+        empty_durations + initial_durations
+    )
     step_history: list[dict[str, object]] = []
     status = "max_steps_inconclusive"
     final_boxes: list[SearchBox] = []
@@ -2084,12 +2763,36 @@ def run_search(
         active_boxes = next_boxes
         final_boxes = next_boxes
 
-    gif_path = output_dir / "laser_welding_adaptive_search.gif"
-    create_gif(animation_paths, gif_path, duration_ms=animation_durations)
+    final_regions: list[FinalRegion] = []
+    boundary_acquired_points = np.empty((0, 3), dtype=float)
+    if status == "converged" and final_boxes:
+        final_regions, boundary_acquired_points = refine_final_regions(
+            final_boxes,
+            domain,
+            settings,
+            experiment_cache,
+            first_sampled_step=len(step_history) + 1,
+        )
+        if final_regions:
+            final_boxes = [region.goal_box for region in final_regions]
+            goal_paths, goal_durations = render_final_goal_frames(
+                output_dir,
+                len(step_history),
+                domain,
+                final_regions,
+                experiment_frame(experiment_cache),
+                boundary_acquired_points,
+                settings,
+            )
+            animation_paths.extend(goal_paths)
+            animation_durations.extend(goal_durations)
 
     experiments_path = output_dir / "adaptive_search_experiments.csv"
     final_frame = experiment_frame(experiment_cache)
     final_frame.to_csv(experiments_path, index=False, float_format="%.8g")
+
+    gif_path = output_dir / "laser_welding_adaptive_search.gif"
+    create_gif(animation_paths, gif_path, duration_ms=animation_durations)
 
     summary = {
         "status": status,
@@ -2102,6 +2805,19 @@ def run_search(
         "final_condition_boxes": [
             box_to_dict(box) for box in final_boxes
         ],
+        "final_boundary_refinement": {
+            "rounds": settings.final_boundary_rounds,
+            "additional_experiments": int(
+                len(boundary_acquired_points)
+            ),
+            "probability_threshold": (
+                settings.final_feasible_probability
+            ),
+            "region_count": len(final_regions),
+            "boundary_face_counts": [
+                len(region.boundary_faces) for region in final_regions
+            ],
+        },
         "settings": asdict(settings),
         "step_history": step_history,
         "gif_file": gif_path.name,
